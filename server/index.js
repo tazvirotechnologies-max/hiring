@@ -7,6 +7,7 @@ const fs = require('fs');
 const multer = require('multer');
 const path = require('path');
 const { hashPassword, initDb, pool, verifyPassword } = require('./db');
+const { sendCandidateCompletionEmail, sendCandidateStartEmail } = require('./mailer');
 const { getCodingQuestions, gradeAptitude, pickAptitudeQuestions } = require('./questionBank');
 
 const app = express();
@@ -25,6 +26,12 @@ const upload = multer({
 
 const asyncRoute = (handler) => (req, res, next) => {
   Promise.resolve(handler(req, res, next)).catch(next);
+};
+
+const queueEmail = (task, label) => {
+  Promise.resolve(task()).catch((error) => {
+    console.error(`Failed to send ${label}:`, error.message || error);
+  });
 };
 
 const normalizeMimeType = (value) => {
@@ -395,6 +402,16 @@ app.post('/api/candidates', upload.single('resume'), asyncRoute(async (req, res)
     [candidate.rows[0].id, designation],
   );
 
+  queueEmail(
+    () => sendCandidateStartEmail({
+      name: candidate.rows[0].name,
+      email: candidate.rows[0].email,
+      mobile: candidate.rows[0].mobile,
+      designation: candidate.rows[0].designation,
+    }),
+    'candidate start email',
+  );
+
   res.status(201).json({ candidate: candidate.rows[0], attempt: attempt.rows[0] });
 }));
 
@@ -418,6 +435,23 @@ app.post('/api/attempts/:attemptId/aptitude', asyncRoute(async (req, res) => {
 
   if (!result.rowCount) {
     return res.status(404).json({ message: 'Attempt not found.' });
+  }
+
+  if (!passed) {
+    const candidateResult = await pool.query(
+      `SELECT c.name, c.email
+       FROM assessment_attempts a
+       JOIN candidates c ON c.id = a.candidate_id
+       WHERE a.id = $1`,
+      [attemptId],
+    );
+
+    if (candidateResult.rowCount) {
+      queueEmail(
+        () => sendCandidateCompletionEmail(candidateResult.rows[0]),
+        'candidate completion email',
+      );
+    }
   }
 
   res.json({ score, total: 40, passed, attempt: result.rows[0] });
@@ -447,6 +481,21 @@ app.post('/api/attempts/:attemptId/coding', asyncRoute(async (req, res) => {
      RETURNING *`,
     [designation, JSON.stringify(questions || []), JSON.stringify(submissions || {}), attemptId],
   );
+
+  const candidateResult = await pool.query(
+    `SELECT c.name, c.email
+     FROM assessment_attempts a
+     JOIN candidates c ON c.id = a.candidate_id
+     WHERE a.id = $1`,
+    [attemptId],
+  );
+
+  if (candidateResult.rowCount) {
+    queueEmail(
+      () => sendCandidateCompletionEmail(candidateResult.rows[0]),
+      'candidate completion email',
+    );
+  }
 
   res.json({ attempt: result.rows[0] });
 }));
