@@ -17,24 +17,18 @@ const authSecret = process.env.ADMIN_AUTH_SECRET || 'tazviro-hiring-admin-secret
 fs.mkdirSync(path.join(uploadRoot, 'resumes'), { recursive: true });
 fs.mkdirSync(path.join(uploadRoot, 'recordings'), { recursive: true });
 
-const storage = multer.diskStorage({
-  destination: (_req, file, cb) => {
-    const folder = file.fieldname === 'cameraRecording' ? 'recordings' : 'resumes';
-    cb(null, path.join(uploadRoot, folder));
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '');
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
-});
-
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
 const asyncRoute = (handler) => (req, res, next) => {
   Promise.resolve(handler(req, res, next)).catch(next);
+};
+
+const normalizeMimeType = (value) => {
+  const mime = (value || '').trim().toLowerCase();
+  return mime || 'application/octet-stream';
 };
 
 const toPublicUploadUrl = (filePath = '') => {
@@ -50,22 +44,79 @@ const toPublicUploadUrl = (filePath = '') => {
   return `/uploads/${relativePath}`;
 };
 
-const sendStoredFile = async ({ res, queryText, id, missingMessage, downloadName }) => {
-  const result = await pool.query(queryText, [id]);
-  if (!result.rowCount || !result.rows[0].file_path) {
+const sendLegacyDiskFile = ({ res, filePath, missingMessage, downloadName, forceDownload = false }) => {
+  if (!filePath) {
     return res.status(404).json({ message: missingMessage });
   }
 
-  const filePath = result.rows[0].file_path;
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ message: 'Stored file was not found on disk.' });
   }
 
   if (downloadName) {
-    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(downloadName)}"`);
+    const dispositionType = forceDownload ? 'attachment' : 'inline';
+    res.setHeader('Content-Disposition', `${dispositionType}; filename="${encodeURIComponent(downloadName)}"`);
   }
 
   return res.sendFile(path.resolve(filePath));
+};
+
+const sendDbFile = ({ res, row, forceDownload = false }) => {
+  if (!row || !row.file_data) {
+    return res.status(404).json({ message: 'Stored file was not found.' });
+  }
+
+  const mimeType = normalizeMimeType(row.mime_type);
+  res.setHeader('Content-Type', mimeType);
+  res.setHeader('Content-Length', Number(row.file_size || row.file_data.length || 0));
+
+  const dispositionType = forceDownload ? 'attachment' : 'inline';
+  const fileName = row.original_name || 'file';
+  res.setHeader('Content-Disposition', `${dispositionType}; filename="${encodeURIComponent(fileName)}"`);
+
+  return res.send(row.file_data);
+};
+
+const persistUploadToDb = async (file) => {
+  if (!file || !file.buffer) {
+    return null;
+  }
+
+  const originalName = file.originalname || 'file';
+  const mimeType = normalizeMimeType(file.mimetype);
+  const fileSize = Number(file.size || file.buffer.length || 0);
+
+  const result = await pool.query(
+    `INSERT INTO stored_files (original_name, mime_type, file_size, file_data)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id`,
+    [originalName, mimeType, fileSize, file.buffer],
+  );
+
+  return result.rows[0].id;
+};
+
+const maybeMigrateLegacyFile = async ({ filePath, originalName, mimeType, updateQueryText, updateParams }) => {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const fileData = fs.readFileSync(filePath);
+  const inserted = await pool.query(
+    `INSERT INTO stored_files (original_name, mime_type, file_size, file_data)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id`,
+    [
+      originalName || path.basename(filePath),
+      normalizeMimeType(mimeType),
+      Number(fileData.length),
+      fileData,
+    ],
+  );
+
+  const newId = inserted.rows[0].id;
+  await pool.query(updateQueryText, [...updateParams, newId]);
+  return newId;
 };
 
 const base64UrlEncode = (value) => Buffer.from(value).toString('base64url');
@@ -153,49 +204,154 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/admin/assets/resume/:candidateId', asyncRoute(async (req, res) => {
-  await sendStoredFile({
+  const candidateId = Number(req.params.candidateId);
+  const result = await pool.query(
+    `SELECT
+       c.resume_file_id,
+       c.resume_path,
+       c.resume_original_name,
+       sf.original_name,
+       sf.mime_type,
+       sf.file_size,
+       sf.file_data
+     FROM candidates c
+     LEFT JOIN stored_files sf ON sf.id = c.resume_file_id
+     WHERE c.id = $1`,
+    [candidateId],
+  );
+
+  if (!result.rowCount) {
+    return res.status(404).json({ message: 'Resume was not found for this candidate.' });
+  }
+
+  const row = result.rows[0];
+  if (row.resume_file_id) {
+    return sendDbFile({ res, row, forceDownload: false });
+  }
+
+  const migratedId = await maybeMigrateLegacyFile({
+    filePath: row.resume_path,
+    originalName: row.resume_original_name,
+    mimeType: 'application/octet-stream',
+    updateQueryText: `UPDATE candidates SET resume_file_id = $2, updated_at = NOW() WHERE id = $1`,
+    updateParams: [candidateId],
+  });
+
+  if (migratedId) {
+    const migrated = await pool.query(
+      `SELECT original_name, mime_type, file_size, file_data FROM stored_files WHERE id = $1`,
+      [migratedId],
+    );
+    return sendDbFile({ res, row: migrated.rows[0], forceDownload: false });
+  }
+
+  return sendLegacyDiskFile({
     res,
-    id: Number(req.params.candidateId),
+    filePath: row.resume_path,
     missingMessage: 'Resume was not found for this candidate.',
-    downloadName: undefined,
-    queryText: `
-      SELECT resume_path AS file_path
-      FROM candidates
-      WHERE id = $1
-    `,
+    downloadName: row.resume_original_name,
+    forceDownload: false,
   });
 }));
 
 app.get('/api/admin/assets/resume/:candidateId/download', asyncRoute(async (req, res) => {
-  const candidate = await pool.query(
-    `SELECT resume_path AS file_path, resume_original_name
-     FROM candidates
-     WHERE id = $1`,
-    [Number(req.params.candidateId)],
+  const candidateId = Number(req.params.candidateId);
+  const result = await pool.query(
+    `SELECT
+       c.resume_file_id,
+       c.resume_path,
+       c.resume_original_name,
+       sf.original_name,
+       sf.mime_type,
+       sf.file_size,
+       sf.file_data
+     FROM candidates c
+     LEFT JOIN stored_files sf ON sf.id = c.resume_file_id
+     WHERE c.id = $1`,
+    [candidateId],
   );
 
-  if (!candidate.rowCount || !candidate.rows[0].file_path) {
+  if (!result.rowCount) {
     return res.status(404).json({ message: 'Resume was not found for this candidate.' });
   }
 
-  if (!fs.existsSync(candidate.rows[0].file_path)) {
-    return res.status(404).json({ message: 'Stored file was not found on disk.' });
+  const row = result.rows[0];
+  if (row.resume_file_id) {
+    return sendDbFile({ res, row, forceDownload: true });
   }
 
-  return res.download(path.resolve(candidate.rows[0].file_path), candidate.rows[0].resume_original_name || 'resume');
+  const migratedId = await maybeMigrateLegacyFile({
+    filePath: row.resume_path,
+    originalName: row.resume_original_name,
+    mimeType: 'application/octet-stream',
+    updateQueryText: `UPDATE candidates SET resume_file_id = $2, updated_at = NOW() WHERE id = $1`,
+    updateParams: [candidateId],
+  });
+
+  if (migratedId) {
+    const migrated = await pool.query(
+      `SELECT original_name, mime_type, file_size, file_data FROM stored_files WHERE id = $1`,
+      [migratedId],
+    );
+    return sendDbFile({ res, row: migrated.rows[0], forceDownload: true });
+  }
+
+  return sendLegacyDiskFile({
+    res,
+    filePath: row.resume_path,
+    missingMessage: 'Resume was not found for this candidate.',
+    downloadName: row.resume_original_name || 'resume',
+    forceDownload: true,
+  });
 }));
 
 app.get('/api/admin/assets/recording/:attemptId', asyncRoute(async (req, res) => {
-  await sendStoredFile({
+  const attemptId = Number(req.params.attemptId);
+  const result = await pool.query(
+    `SELECT
+       a.camera_recording_file_id,
+       a.camera_recording_path,
+       sf.original_name,
+       sf.mime_type,
+       sf.file_size,
+       sf.file_data
+     FROM assessment_attempts a
+     LEFT JOIN stored_files sf ON sf.id = a.camera_recording_file_id
+     WHERE a.id = $1`,
+    [attemptId],
+  );
+
+  if (!result.rowCount) {
+    return res.status(404).json({ message: 'Recording was not found for this attempt.' });
+  }
+
+  const row = result.rows[0];
+  if (row.camera_recording_file_id) {
+    return sendDbFile({ res, row, forceDownload: false });
+  }
+
+  const migratedId = await maybeMigrateLegacyFile({
+    filePath: row.camera_recording_path,
+    originalName: `attempt-${attemptId}.webm`,
+    mimeType: 'video/webm',
+    updateQueryText: `UPDATE assessment_attempts SET camera_recording_file_id = $2, updated_at = NOW() WHERE id = $1`,
+    updateParams: [attemptId],
+  });
+
+  if (migratedId) {
+    const migrated = await pool.query(
+      `SELECT original_name, mime_type, file_size, file_data FROM stored_files WHERE id = $1`,
+      [migratedId],
+    );
+    return sendDbFile({ res, row: migrated.rows[0], forceDownload: false });
+  }
+
+  return sendLegacyDiskFile({
     res,
-    id: Number(req.params.attemptId),
+    filePath: row.camera_recording_path,
     missingMessage: 'Recording was not found for this attempt.',
-    downloadName: undefined,
-    queryText: `
-      SELECT camera_recording_path AS file_path
-      FROM assessment_attempts
-      WHERE id = $1
-    `,
+    downloadName: `attempt-${attemptId}.webm`,
+    forceDownload: false,
   });
 }));
 
@@ -218,11 +374,13 @@ app.post('/api/candidates', upload.single('resume'), asyncRoute(async (req, res)
     });
   }
 
+  const resumeFileId = await persistUploadToDb(req.file);
+
   const candidate = await pool.query(
-    `INSERT INTO candidates (name, email, mobile, designation, resume_path, resume_original_name)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO candidates (name, email, mobile, designation, resume_path, resume_file_id, resume_original_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING *`,
-    [name.trim(), normalizedEmail, mobile.trim(), designation, req.file.path, req.file.originalname],
+    [name.trim(), normalizedEmail, mobile.trim(), designation, null, resumeFileId, req.file.originalname],
   );
 
   const attempt = await pool.query(
@@ -295,19 +453,21 @@ app.post('/api/attempts/:attemptId/recording', upload.single('cameraRecording'),
     return res.status(400).json({ message: 'Camera recording is required.' });
   }
 
+  const recordingFileId = await persistUploadToDb(req.file);
+
   const result = await pool.query(
     `UPDATE assessment_attempts
-     SET camera_recording_path = $1, updated_at = NOW()
-     WHERE id = $2
-     RETURNING camera_recording_path`,
-    [req.file.path, attemptId],
+     SET camera_recording_path = $1, camera_recording_file_id = $2, updated_at = NOW()
+     WHERE id = $3
+     RETURNING camera_recording_file_id`,
+    [null, recordingFileId, attemptId],
   );
 
   if (!result.rowCount) {
     return res.status(404).json({ message: 'Attempt not found.' });
   }
 
-  res.json({ recordingPath: result.rows[0].camera_recording_path });
+  res.json({ recordingFileId: result.rows[0].camera_recording_file_id });
 }));
 
 app.post('/api/admin/login', asyncRoute(async (req, res) => {
@@ -372,6 +532,7 @@ app.get('/api/admin/candidates', requireAdminAuth, asyncRoute(async (_req, res) 
       c.designation,
       c.resume_original_name,
       c.resume_path,
+      c.resume_file_id,
       c.created_at AS candidate_created_at,
       a.id AS attempt_id,
       a.aptitude_score,
@@ -381,6 +542,7 @@ app.get('/api/admin/candidates', requireAdminAuth, asyncRoute(async (_req, res) 
       a.coding_questions,
       a.coding_submissions,
       a.camera_recording_path,
+      a.camera_recording_file_id,
       a.completed_at,
       a.created_at AS attempt_created_at,
       CASE
@@ -398,9 +560,9 @@ app.get('/api/admin/candidates', requireAdminAuth, asyncRoute(async (_req, res) 
     ...row,
     resume_url: toPublicUploadUrl(row.resume_path),
     recording_url: toPublicUploadUrl(row.camera_recording_path),
-    resume_view_url: row.resume_path ? `/api/admin/assets/resume/${row.candidate_id}` : null,
-    resume_download_url: row.resume_path ? `/api/admin/assets/resume/${row.candidate_id}/download` : null,
-    recording_view_url: row.camera_recording_path ? `/api/admin/assets/recording/${row.attempt_id}` : null,
+    resume_view_url: row.resume_file_id || row.resume_path ? `/api/admin/assets/resume/${row.candidate_id}` : null,
+    resume_download_url: row.resume_file_id || row.resume_path ? `/api/admin/assets/resume/${row.candidate_id}/download` : null,
+    recording_view_url: row.camera_recording_file_id || row.camera_recording_path ? `/api/admin/assets/recording/${row.attempt_id}` : null,
   }));
 
   res.json({ candidates });
