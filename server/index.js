@@ -12,6 +12,7 @@ const { getCodingQuestions, gradeAptitude, pickAptitudeQuestions } = require('./
 const app = express();
 const port = process.env.PORT || 5000;
 const uploadRoot = path.join(__dirname, 'uploads');
+const clientBuildRoot = path.join(__dirname, '..', 'build');
 const authSecret = process.env.ADMIN_AUTH_SECRET || 'tazviro-hiring-admin-secret';
 
 fs.mkdirSync(path.join(uploadRoot, 'resumes'), { recursive: true });
@@ -198,6 +199,10 @@ const requireAdminAuth = asyncRoute(async (req, res, next) => {
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 app.use('/uploads', express.static(uploadRoot));
+
+if (fs.existsSync(clientBuildRoot)) {
+  app.use(express.static(clientBuildRoot));
+}
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
@@ -605,6 +610,16 @@ app.post('/api/admin/users', requireAdminAuth, asyncRoute(async (req, res) => {
 
   res.status(201).json({ user: result.rows[0] });
 }));
+
+if (fs.existsSync(clientBuildRoot)) {
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+      return next();
+    }
+
+    return res.sendFile(path.join(clientBuildRoot, 'index.html'));
+  });
+}
 
 app.use((err, _req, res, _next) => {
   console.error(err);
